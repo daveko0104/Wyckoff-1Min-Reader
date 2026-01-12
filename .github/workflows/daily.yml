@@ -42,7 +42,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add reports/
           git status
+
           git commit -m "chore: daily report" || echo "No changes to commit"
-          git push
+
+          # 关键：先把远端最新提交rebase到本地，再推送
+          git pull --rebase origin main
+          git push origin main
+
