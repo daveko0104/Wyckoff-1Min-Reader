@@ -11,18 +11,23 @@ import markdown
 from xhtml2pdf import pisa
 
 # ==========================================
-# 1. 数据获取模块
+# 1. 数据获取模块 (升级版：支持多周期)
 # ==========================================
 
-def fetch_a_share_minute(symbol: str) -> pd.DataFrame:
-    """获取A股1分钟K线 (使用东方财富接口)"""
+def fetch_stock_data(symbol: str, period: str) -> pd.DataFrame:
+    """
+    获取A股K线数据
+    :param symbol: 股票代码
+    :param period: 周期 ('1', '5', '15', '30', '60')
+    """
     symbol_code = ''.join(filter(str.isdigit, symbol))
-    print(f"   -> 正在获取 {symbol_code} 数据...")
+    print(f"   -> 正在获取 {symbol_code} 的 {period} 分钟数据...")
 
     try:
+        # 东方财富接口支持: "1", "5", "15", "30", "60"
         df = ak.stock_zh_a_hist_min_em(
             symbol=symbol_code, 
-            period="1", 
+            period=period, 
             adjust="qfq"
         )
     except Exception as e:
@@ -44,26 +49,27 @@ def fetch_a_share_minute(symbol: str) -> pd.DataFrame:
     
     # === Open=0 修复逻辑 ===
     if (df["open"] == 0).any():
-        print(f"   [清洗] 修复 Open=0 数据...")
         df["open"] = df["open"].replace(0, np.nan)
         df["open"] = df["open"].fillna(df["close"].shift(1))
         df["open"] = df["open"].fillna(df["close"])
 
-    bars_count = int(os.getenv("BARS_COUNT", 600))
+    # 稍微减少数据量，防止Token爆炸，保留最近 100 根足够看 SCOB
+    bars_count = int(os.getenv("BARS_COUNT", 100)) 
     df = df.sort_values("date").tail(bars_count).reset_index(drop=True)
     return df
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ma50"] = df["close"].rolling(50).mean()
-    df["ma200"] = df["close"].rolling(200).mean()
+    # 均线辅助判断趋势
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
     return df
 
 # ==========================================
-# 2. 本地绘图模块
+# 2. 本地绘图模块 (适配多周期标题)
 # ==========================================
 
-def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str):
+def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: str):
     if df.empty: return
 
     plot_df = df.copy()
@@ -83,89 +89,111 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str):
     )
 
     apds = []
-    if 'ma50' in plot_df.columns:
-        apds.append(mpf.make_addplot(plot_df['ma50'], color='#ff9900', width=1.5))
-    if 'ma200' in plot_df.columns:
-        apds.append(mpf.make_addplot(plot_df['ma200'], color='#2196f3', width=2.0))
+    if 'ma20' in plot_df.columns:
+        apds.append(mpf.make_addplot(plot_df['ma20'], color='#ff9900', width=1.0))
 
     try:
         mpf.plot(
             plot_df, type='candle', style=s, addplot=apds, volume=True,
-            title=f"Wyckoff Setup: {symbol}",
-            savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'),
+            title=f"SCOB Setup: {symbol} ({period}m)",
+            savefig=dict(fname=save_path, dpi=100, bbox_inches='tight'),
             warn_too_much_data=2000
         )
-        print(f"   [OK] 图表已保存")
+        print(f"   [OK] {period}m 图表已保存")
     except Exception as e:
         print(f"   [Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块
+# 3. AI 分析模块 (SCOB 专用 Prompt)
 # ==========================================
 
-def get_prompt_content(symbol, df):
-    prompt_template = os.getenv("WYCKOFF_PROMPT_TEMPLATE")
-    if not prompt_template and os.path.exists("prompt_secret.txt"):
-        try:
-            with open("prompt_secret.txt", "r", encoding="utf-8") as f:
-                prompt_template = f.read()
-        except: pass
-    if not prompt_template: return None
-
-    csv_data = df.to_csv(index=False)
+def get_scob_prompt(symbol, df, period):
+    """生成 SCOB 专用提示词"""
+    csv_data = df.tail(40).to_csv(index=False) # 只给 AI 看最近 40 根，减少干扰
     latest = df.iloc[-1]
-    return prompt_template.replace("{symbol}", symbol) \
-                          .replace("{latest_time}", str(latest["date"])) \
-                          .replace("{latest_price}", str(latest["close"])) \
-                          .replace("{csv_data}", csv_data)
+    
+    # 定义周期上下文
+    timeframe_context = ""
+    if period == '60':
+        timeframe_context = "这是一个 **60分钟** 大级别图表，请重点关注趋势反转信号。"
+    else:
+        timeframe_context = f"这是一个 **{period}分钟** 日内图表，请重点关注回调结束的切入点。"
 
-def call_gemini_http(prompt: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key: raise ValueError("GEMINI_API_KEY missing")
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
-    print(f"   >>> Gemini ({model_name})...")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    headers = {'Content-Type': 'application/json'}
-    data = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "system_instruction": {"parts": [{"text": "You are Richard D. Wyckoff. You follow strict Wyckoff logic."}]},
-        "generationConfig": {"temperature": 0.2}
-    }
-    resp = requests.post(url, headers=headers, json=data)
-    if resp.status_code != 200: raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
-    return resp.json()['candidates'][0]['content']['parts'][0]['text']
+    prompt = f"""
+**Role**: 你是一位精通 SMC (Smart Money Concepts) 的 A 股交易员。
+**Task**: 分析这张 {symbol} 的 **{period}分钟** K线数据，寻找【Single Candle Order Block (SCOB)】形态。
 
-def call_openai_official(prompt: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key: raise ValueError("OPENAI_API_KEY missing")
-    model_name = os.getenv("AI_MODEL", "gpt-4o")
-    print(f"   >>> OpenAI ({model_name})...")
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=model_name, 
-        messages=[{"role": "system", "content": "You are Richard D. Wyckoff."}, {"role": "user", "content": prompt}],
-        temperature=0.2 
-    )
-    return resp.choices[0].message.content
+**Context**:
+{timeframe_context}
+当前最新价格: {latest['close']}
+当前最新时间: {latest['date']}
 
-def ai_analyze(symbol, df):
-    prompt = get_prompt_content(symbol, df)
-    if not prompt: return "Error: No Prompt"
-    try: return call_gemini_http(prompt)
-    except Exception as e: 
-        print(f"   [Warn] Gemini 失败: {e}")
-        try: return call_openai_official(prompt)
-        except Exception as e2: return f"Analysis Failed: {e2}"
+**Analysis Logic (SCOB Criteria)**:
+1. **Liquidity Sweep (流动性掠夺)**: 
+   - 观察最近的K线（特别是影线）是否刺破了左侧明显的短期高点或低点？
+2. **Displacement (动能反转)**:
+   - 扫掉止损后，价格是否迅速收回并向反方向运动？
+3. **Volume**: 
+   - 关键K线是否伴随异常成交量？
+
+**Data**:
+{csv_data}
+
+**Output Format (Strictly follow this)**:
+- **Timeframe**: {period} min
+- **SCOB Signal**: [YES / NO] (仅当形态非常标准时回答 YES)
+- **Direction**: [BULLISH (看涨) / BEARISH (看跌) / NONE]
+- **Confidence**: [1-10]
+- **Analysis**: (简述 50 字以内，指出哪一根K线是 Order Block)
+- **Suggestion**: (如果 YES，给出激进买点；如果 NO，建议观望)
+"""
+    return prompt
+
+def call_ai_api(prompt: str) -> str:
+    """统一调用 AI 接口 (Gemini 优先, GPT 兜底)"""
+    
+    # --- 尝试 Gemini ---
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp") # 推荐用 2.0 flash，看图能力强
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+            data = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2}
+            }
+            resp = requests.post(url, headers={'Content-Type': 'application/json'}, json=data)
+            if resp.status_code == 200:
+                return resp.json()['candidates'][0]['content']['parts'][0]['text']
+        except Exception as e:
+            print(f"   [Warn] Gemini Error: {e}")
+
+    # --- 尝试 OpenAI ---
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            client = OpenAI(api_key=openai_key)
+            resp = client.chat.completions.create(
+                model=os.getenv("AI_MODEL", "gpt-4o"), 
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2 
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            return f"OpenAI Failed: {e}"
+            
+    return "Error: No valid API Key found."
 
 # ==========================================
 # 4. PDF 生成模块
 # ==========================================
 
-def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
+def generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
     html_content = markdown.markdown(report_text)
     abs_chart_path = os.path.abspath(chart_path)
-    font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
-    if not os.path.exists(font_path): font_path = "msyh.ttc" 
+    # 简单字体回退逻辑
+    font_path = "msyh.ttc" 
+    if not os.path.exists(font_path): font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     
     full_html = f"""
     <html>
@@ -174,115 +202,104 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
         <style>
             @font-face {{ font-family: "MyChineseFont"; src: url("{font_path}"); }}
             @page {{ size: A4; margin: 1cm; }}
-            body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; line-height: 1.5; }}
-            h1, h2, h3, p, div {{ font-family: "MyChineseFont", sans-serif; color: #2c3e50; }}
-            /* 18cm 固定宽度防止报错 */
-            img {{ width: 18cm; margin-bottom: 20px; }}
-            .header {{ text-align: center; margin-bottom: 20px; color: #7f8c8d; font-size: 10px; }}
-            pre {{ background: #f4f4f4; padding: 10px; border-radius: 5px; }}
+            body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; }}
+            img {{ width: 16cm; }}
+            .period-tag {{ background: #2c3e50; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; }}
         </style>
     </head>
     <body>
-        <div class="header">Wyckoff Quantitative Analysis Report | Generated by AI Agent</div>
+        <div style="margin-bottom:10px;">
+            <span class="period-tag">SCOB Strategy</span>
+            <span class="period-tag" style="background:#e67e22;">{period} MIN Timeframe</span>
+        </div>
         <img src="{abs_chart_path}" />
         <hr/>
         {html_content}
-        <div style="text-align:right; color:#bdc3c7; font-size:8px;">Target: {symbol} | Data: EastMoney</div>
+        <div style="text-align:right; color:#bdc3c7; font-size:8px;">
+            Symbol: {symbol} | Time: {datetime.now().strftime('%H:%M:%S')}
+        </div>
     </body>
     </html>
     """
     try:
         with open(pdf_path, "wb") as pdf_file:
             pisa.CreatePDF(full_html, dest=pdf_file)
-        print(f"   [OK] PDF Generated: {pdf_path}")
         return True
     except Exception as e:
-        print(f"   [Error] PDF 生成失败: {e}")
+        print(f"   [Error] PDF生成失败: {e}")
         return False
 
 # ==========================================
-# 5. 主程序 (生成清单 push_list.txt)
+# 5. 主程序
 # ==========================================
 
 def process_one_stock(symbol: str, generated_files: list):
-    """处理单个股票，成功则将文件路径加入 generated_files 列表"""
     print(f"\n{'='*40}")
-    print(f"🚀 开始分析: {symbol}")
+    print(f"🚀 分析标的: {symbol}")
     print(f"{'='*40}")
 
-    df = fetch_a_share_minute(symbol)
-    if df.empty:
-        print(f"   [Skip] 数据为空，跳过 {symbol}")
-        return
-    df = add_indicators(df)
+    # === 关键修改：遍历多个周期 ===
+    target_periods = ['15', '30', '60']
+    
+    for period in target_periods:
+        # 1. 获取对应周期数据
+        df = fetch_stock_data(symbol, period)
+        if df.empty: continue
+        df = add_indicators(df)
 
-    # === 关键：使用北京时间生成唯一文件名 ===
-    beijing_tz = timezone(timedelta(hours=8))
-    ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
-    
-    csv_path = f"data/{symbol}_1min_{ts}.csv"
-    chart_path = f"reports/{symbol}_chart_{ts}.png"
-    pdf_path = f"reports/{symbol}_report_{ts}.pdf"
-    
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    generate_local_chart(symbol, df, chart_path)
-    report_text = ai_analyze(symbol, df)
-    
-    if generate_pdf_report(symbol, chart_path, report_text, pdf_path):
-        # 成功生成 PDF，加入推送清单
-        generated_files.append(pdf_path)
-    
-    # 调试用 MD
-    md_path = f"reports/{symbol}_report_{ts}.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-    
-    print(f"✅ {symbol} 处理完成")
+        # 2. 生成文件名 (带周期标识)
+        beijing_tz = timezone(timedelta(hours=8))
+        ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M")
+        
+        # 文件名示例: 600519_30m_20240118.pdf
+        chart_path = f"reports/{symbol}_{period}m_chart_{ts}.png"
+        pdf_path = f"reports/{symbol}_{period}m_report_{ts}.pdf"
+
+        # 3. 绘图
+        generate_local_chart(symbol, df, chart_path, period)
+
+        # 4. AI 分析
+        prompt = get_scob_prompt(symbol, df, period)
+        report_text = call_ai_api(prompt)
+
+        # 5. 生成 PDF
+        # 只有当 AI 说是 "SCOB Signal: YES" 或者强制生成时才生成？
+        # 这里为了演示，全部生成。如果想过滤，可以检查 report_text 里的关键词。
+        if generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
+            print(f"   ✅ {period}m 研报已生成")
+            generated_files.append(pdf_path)
+        
+        # 稍微停顿，防止请求过快
+        time.sleep(2)
 
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
 
-    # 1. 读取股票列表
+    # 读取列表
     symbols = []
     if os.path.exists("stock_list.txt"):
-        print("📂 读取 stock_list.txt...")
-        try:
-            with open("stock_list.txt", "r", encoding="utf-8") as f:
-                symbols = [line.strip() for line in f.readlines() if line.strip() and not line.startswith("#")]
-        except: pass
-
+        with open("stock_list.txt", "r", encoding="utf-8") as f:
+            symbols = [line.strip() for line in f.readlines() if line.strip() and not line.startswith("#")]
+    
     if not symbols:
-        symbols_env = os.getenv("SYMBOLS", "600970")
-        symbols = [s.strip() for s in symbols_env.split(",") if s.strip()]
+        # 默认测试股: 茅台
+        symbols = ["600519"]
 
-    symbols = list(set(symbols))
-    if not symbols: return
-
-    # 2. 准备一个列表，记录本次新生成的 PDF
     generated_pdfs = []
 
-    # 3. 循环处理
-    for i, symbol in enumerate(symbols):
+    for symbol in symbols:
         try:
             process_one_stock(symbol, generated_pdfs)
         except Exception as e:
-            print(f"❌ {symbol} 错误: {e}")
-        
-        if i < len(symbols) - 1:
-            print(f"⏳ 休息 10 秒...")
-            time.sleep(10)
+            print(f"❌ {symbol} 全局错误: {e}")
 
-    # 4. === 核心：将本次生成的文件列表写入文件 ===
-    # 这样 daily.yml 就知道该推哪几个了
+    # 生成推送清单
     if generated_pdfs:
-        print(f"\n📝 生成推送清单 ({len(generated_pdfs)} 个文件):")
         with open("push_list.txt", "w", encoding="utf-8") as f:
             for pdf in generated_pdfs:
-                print(f"   -> {pdf}")
                 f.write(f"{pdf}\n")
-    else:
-        print("\n⚠️ 本次没有生成任何 PDF，不创建 push_list.txt")
+        print(f"\n📝 推送清单已更新: 包含 {len(generated_pdfs)} 份多周期研报")
 
 if __name__ == "__main__":
     main()
