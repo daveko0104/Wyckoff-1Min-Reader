@@ -11,14 +11,14 @@ import markdown
 from xhtml2pdf import pisa
 
 # ==========================================
-# 1. 数据获取模块 (升级版：支持多周期)
+# 1. 数据获取模块 (支持多周期)
 # ==========================================
 
 def fetch_stock_data(symbol: str, period: str) -> pd.DataFrame:
     """
     获取A股K线数据
     :param symbol: 股票代码
-    :param period: 周期 ('1', '5', '15', '30', '60')
+    :param period: 周期 ('15', '30', '60')
     """
     symbol_code = ''.join(filter(str.isdigit, symbol))
     print(f"   -> 正在获取 {symbol_code} 的 {period} 分钟数据...")
@@ -53,7 +53,7 @@ def fetch_stock_data(symbol: str, period: str) -> pd.DataFrame:
         df["open"] = df["open"].fillna(df["close"].shift(1))
         df["open"] = df["open"].fillna(df["close"])
 
-    # 稍微减少数据量，防止Token爆炸，保留最近 100 根足够看 SCOB
+    # 保留最近 100 根足够看 SCOB，减少 Token 消耗
     bars_count = int(os.getenv("BARS_COUNT", 100)) 
     df = df.sort_values("date").tail(bars_count).reset_index(drop=True)
     return df
@@ -66,7 +66,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ==========================================
-# 2. 本地绘图模块 (适配多周期标题)
+# 2. 本地绘图模块
 # ==========================================
 
 def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: str):
@@ -104,15 +104,14 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
         print(f"   [Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (SCOB 专用 Prompt)
+# 3. AI 分析模块 (通义千问版)
 # ==========================================
 
 def get_scob_prompt(symbol, df, period):
     """生成 SCOB 专用提示词"""
-    csv_data = df.tail(40).to_csv(index=False) # 只给 AI 看最近 40 根，减少干扰
+    csv_data = df.tail(40).to_csv(index=False) 
     latest = df.iloc[-1]
     
-    # 定义周期上下文
     timeframe_context = ""
     if period == '60':
         timeframe_context = "这是一个 **60分钟** 大级别图表，请重点关注趋势反转信号。"
@@ -150,13 +149,36 @@ def get_scob_prompt(symbol, df, period):
     return prompt
 
 def call_ai_api(prompt: str) -> str:
-    """统一调用 AI 接口 (Gemini 优先, GPT 兜底)"""
+    """优先使用通义千问 (Qwen)，Gemini/GPT 作为备用"""
     
-    # --- 尝试 Gemini ---
+    # --- 1. 优先尝试：通义千问 (Qwen) ---
+    qwen_key = os.getenv("DASHSCOPE_API_KEY")
+    if qwen_key:
+        try:
+            # 使用 OpenAI SDK 兼容模式调用千问
+            client = OpenAI(
+                api_key=qwen_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+            )
+            
+            # 使用 qwen-plus (性价比高)
+            resp = client.chat.completions.create(
+                model="qwen-plus", 
+                messages=[
+                    {"role": "system", "content": "你是专业的A股SMC交易员。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"   [Warn] Qwen (通义千问) 调用失败: {e}")
+
+    # --- 2. 备用：Google Gemini ---
     gemini_key = os.getenv("GEMINI_API_KEY")
     if gemini_key:
         try:
-            model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp") # 推荐用 2.0 flash，看图能力强
+            model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
             data = {
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -166,23 +188,9 @@ def call_ai_api(prompt: str) -> str:
             if resp.status_code == 200:
                 return resp.json()['candidates'][0]['content']['parts'][0]['text']
         except Exception as e:
-            print(f"   [Warn] Gemini Error: {e}")
-
-    # --- 尝试 OpenAI ---
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
-        try:
-            client = OpenAI(api_key=openai_key)
-            resp = client.chat.completions.create(
-                model=os.getenv("AI_MODEL", "gpt-4o"), 
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2 
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            return f"OpenAI Failed: {e}"
+            print(f"   [Warn] Gemini 失败: {e}")
             
-    return "Error: No valid API Key found."
+    return "Error: 所有 AI 接口均调用失败，请检查 Secret 设置。"
 
 # ==========================================
 # 4. PDF 生成模块
@@ -209,7 +217,7 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
     </head>
     <body>
         <div style="margin-bottom:10px;">
-            <span class="period-tag">SCOB Strategy</span>
+            <span class="period-tag">SCOB Strategy (Qwen AI)</span>
             <span class="period-tag" style="background:#e67e22;">{period} MIN Timeframe</span>
         </div>
         <img src="{abs_chart_path}" />
@@ -238,7 +246,6 @@ def process_one_stock(symbol: str, generated_files: list):
     print(f"🚀 分析标的: {symbol}")
     print(f"{'='*40}")
 
-    # === 关键修改：遍历多个周期 ===
     target_periods = ['15', '30', '60']
     
     for period in target_periods:
@@ -247,44 +254,38 @@ def process_one_stock(symbol: str, generated_files: list):
         if df.empty: continue
         df = add_indicators(df)
 
-        # 2. 生成文件名 (带周期标识)
+        # 2. 生成文件名
         beijing_tz = timezone(timedelta(hours=8))
         ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M")
         
-        # 文件名示例: 600519_30m_20240118.pdf
         chart_path = f"reports/{symbol}_{period}m_chart_{ts}.png"
         pdf_path = f"reports/{symbol}_{period}m_report_{ts}.pdf"
 
         # 3. 绘图
         generate_local_chart(symbol, df, chart_path, period)
 
-        # 4. AI 分析
+        # 4. AI 分析 (Qwen)
         prompt = get_scob_prompt(symbol, df, period)
         report_text = call_ai_api(prompt)
 
         # 5. 生成 PDF
-        # 只有当 AI 说是 "SCOB Signal: YES" 或者强制生成时才生成？
-        # 这里为了演示，全部生成。如果想过滤，可以检查 report_text 里的关键词。
         if generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
             print(f"   ✅ {period}m 研报已生成")
             generated_files.append(pdf_path)
         
-        # 稍微停顿，防止请求过快
-        time.sleep(2)
+        time.sleep(1)
 
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
 
-    # 读取列表
     symbols = []
     if os.path.exists("stock_list.txt"):
         with open("stock_list.txt", "r", encoding="utf-8") as f:
             symbols = [line.strip() for line in f.readlines() if line.strip() and not line.startswith("#")]
     
     if not symbols:
-        # 默认测试股: 茅台
-        symbols = ["600519"]
+        symbols = ["600519"] # 默认测试
 
     generated_pdfs = []
 
@@ -294,12 +295,11 @@ def main():
         except Exception as e:
             print(f"❌ {symbol} 全局错误: {e}")
 
-    # 生成推送清单
     if generated_pdfs:
         with open("push_list.txt", "w", encoding="utf-8") as f:
             for pdf in generated_pdfs:
                 f.write(f"{pdf}\n")
-        print(f"\n📝 推送清单已更新: 包含 {len(generated_pdfs)} 份多周期研报")
+        print(f"\n📝 推送清单已更新: 包含 {len(generated_pdfs)} 份报告")
 
 if __name__ == "__main__":
     main()
