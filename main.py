@@ -11,20 +11,14 @@ import markdown
 from xhtml2pdf import pisa
 
 # ==========================================
-# 1. 数据获取模块 (支持多周期)
+# 1. 数据获取模块
 # ==========================================
 
 def fetch_stock_data(symbol: str, period: str) -> pd.DataFrame:
-    """
-    获取A股K线数据
-    :param symbol: 股票代码
-    :param period: 周期 ('15', '30', '60')
-    """
     symbol_code = ''.join(filter(str.isdigit, symbol))
     print(f"   -> 正在获取 {symbol_code} 的 {period} 分钟数据...")
 
     try:
-        # 东方财富接口支持: "1", "5", "15", "30", "60"
         df = ak.stock_zh_a_hist_min_em(
             symbol=symbol_code, 
             period=period, 
@@ -47,20 +41,18 @@ def fetch_stock_data(symbol: str, period: str) -> pd.DataFrame:
     cols = ["open", "high", "low", "close", "volume"]
     df[cols] = df[cols].astype(float)
     
-    # === Open=0 修复逻辑 ===
     if (df["open"] == 0).any():
         df["open"] = df["open"].replace(0, np.nan)
         df["open"] = df["open"].fillna(df["close"].shift(1))
         df["open"] = df["open"].fillna(df["close"])
 
-    # 保留最近 100 根足够看 SCOB，减少 Token 消耗
+    # 保留最近 100 根
     bars_count = int(os.getenv("BARS_COUNT", 100)) 
     df = df.sort_values("date").tail(bars_count).reset_index(drop=True)
     return df
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # 均线辅助判断趋势
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma60"] = df["close"].rolling(60).mean()
     return df
@@ -99,16 +91,14 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
             savefig=dict(fname=save_path, dpi=100, bbox_inches='tight'),
             warn_too_much_data=2000
         )
-        print(f"   [OK] {period}m 图表已保存")
     except Exception as e:
         print(f"   [Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (通义千问版)
+# 3. AI 分析模块 (只看多头版)
 # ==========================================
 
 def get_scob_prompt(symbol, df, period):
-    """生成 SCOB 专用提示词"""
     csv_data = df.tail(40).to_csv(index=False) 
     latest = df.iloc[-1]
     
@@ -120,52 +110,49 @@ def get_scob_prompt(symbol, df, period):
 
     prompt = f"""
 **Role**: 你是一位精通 SMC (Smart Money Concepts) 的 A 股交易员。
-**Task**: 分析这张 {symbol} 的 **{period}分钟** K线数据，寻找【Single Candle Order Block (SCOB)】形态。
+**Task**: 分析这张 {symbol} 的 **{period}分钟** K线数据，寻找【Bullish SCOB (看涨订单块)】形态。
+
+**Constraint (重要)**:
+1. A股市场只能做多 (Long Only)。
+2. **请直接忽略所有 BEARISH (看跌) 信号。**
+3. 如果是看跌形态，或者形态不标准，请直接回答 SCOB Signal: NO。
 
 **Context**:
 {timeframe_context}
 当前最新价格: {latest['close']}
 当前最新时间: {latest['date']}
 
-**Analysis Logic (SCOB Criteria)**:
-1. **Liquidity Sweep (流动性掠夺)**: 
-   - 观察最近的K线（特别是影线）是否刺破了左侧明显的短期高点或低点？
-2. **Displacement (动能反转)**:
-   - 扫掉止损后，价格是否迅速收回并向反方向运动？
-3. **Volume**: 
-   - 关键K线是否伴随异常成交量？
+**Analysis Logic (Bullish SCOB Criteria)**:
+1. **Liquidity Sweep**: 下影线是否刺破了左侧的前低 (Swing Low) 也就是扫了止损？
+2. **Displacement**: 价格是否在扫止损后迅速向上反弹，并收出阳线？
+3. **Volume**: 关键K线是否伴随异常放量？
 
 **Data**:
 {csv_data}
 
 **Output Format (Strictly follow this)**:
 - **Timeframe**: {period} min
-- **SCOB Signal**: [YES / NO] (仅当形态非常标准时回答 YES)
-- **Direction**: [BULLISH (看涨) / BEARISH (看跌) / NONE]
+- **SCOB Signal**: [YES / NO] (仅当发现标准的 **看涨 (BULLISH)** 信号时才回答 YES)
+- **Direction**: BULLISH
 - **Confidence**: [1-10]
-- **Analysis**: (简述 50 字以内，指出哪一根K线是 Order Block)
-- **Suggestion**: (如果 YES，给出激进买点；如果 NO，建议观望)
+- **Analysis**: (简述理由)
+- **Suggestion**: (给出建议入场位)
 """
     return prompt
 
 def call_ai_api(prompt: str) -> str:
-    """优先使用通义千问 (Qwen)，Gemini/GPT 作为备用"""
-    
     # --- 1. 优先尝试：通义千问 (Qwen) ---
     qwen_key = os.getenv("DASHSCOPE_API_KEY")
     if qwen_key:
         try:
-            # 使用 OpenAI SDK 兼容模式调用千问
             client = OpenAI(
                 api_key=qwen_key,
                 base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
             )
-            
-            # 使用 qwen-plus (性价比高)
             resp = client.chat.completions.create(
                 model="qwen-plus", 
                 messages=[
-                    {"role": "system", "content": "你是专业的A股SMC交易员。"},
+                    {"role": "system", "content": "你是专业的A股SMC交易员，只关注做多机会。"},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2
@@ -190,7 +177,7 @@ def call_ai_api(prompt: str) -> str:
         except Exception as e:
             print(f"   [Warn] Gemini 失败: {e}")
             
-    return "Error: 所有 AI 接口均调用失败，请检查 Secret 设置。"
+    return "Error: 所有 AI 接口均调用失败"
 
 # ==========================================
 # 4. PDF 生成模块
@@ -199,7 +186,6 @@ def call_ai_api(prompt: str) -> str:
 def generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
     html_content = markdown.markdown(report_text)
     abs_chart_path = os.path.abspath(chart_path)
-    # 简单字体回退逻辑
     font_path = "msyh.ttc" 
     if not os.path.exists(font_path): font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
     
@@ -212,13 +198,13 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
             @page {{ size: A4; margin: 1cm; }}
             body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; }}
             img {{ width: 16cm; }}
-            .period-tag {{ background: #2c3e50; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; }}
+            .period-tag {{ background: #d35400; color: white; padding: 2px 8px; border-radius: 4px; font-size: 10px; }}
         </style>
     </head>
     <body>
         <div style="margin-bottom:10px;">
-            <span class="period-tag">SCOB Strategy (Qwen AI)</span>
-            <span class="period-tag" style="background:#e67e22;">{period} MIN Timeframe</span>
+            <span class="period-tag">BULLISH SCOB ONLY</span>
+            <span class="period-tag" style="background:#2980b9;">{period} MIN</span>
         </div>
         <img src="{abs_chart_path}" />
         <hr/>
@@ -249,29 +235,31 @@ def process_one_stock(symbol: str, generated_files: list):
     target_periods = ['15', '30', '60']
     
     for period in target_periods:
-        # 1. 获取对应周期数据
+        # 1. 获取数据
         df = fetch_stock_data(symbol, period)
         if df.empty: continue
         df = add_indicators(df)
 
-        # 2. 生成文件名
         beijing_tz = timezone(timedelta(hours=8))
         ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M")
-        
         chart_path = f"reports/{symbol}_{period}m_chart_{ts}.png"
         pdf_path = f"reports/{symbol}_{period}m_report_{ts}.pdf"
 
-        # 3. 绘图
+        # 2. 绘图
         generate_local_chart(symbol, df, chart_path, period)
 
-        # 4. AI 分析 (Qwen)
+        # 3. AI 分析
         prompt = get_scob_prompt(symbol, df, period)
         report_text = call_ai_api(prompt)
 
-        # 5. 生成 PDF
-        if generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
-            print(f"   ✅ {period}m 研报已生成")
-            generated_files.append(pdf_path)
+        # 4. === 关键过滤逻辑：只推送 BULLISH 信号 ===
+        # 检查 AI 是否输出了 "SCOB Signal: YES"
+        if "SCOB Signal: YES" in report_text:
+            print(f"   🔥 发现【看涨】信号 ({period}m)，正在生成报告...")
+            if generate_pdf_report(symbol, chart_path, report_text, pdf_path, period):
+                generated_files.append(pdf_path)
+        else:
+            print(f"   💤 ({period}m) 无看涨机会，跳过推送。")
         
         time.sleep(1)
 
@@ -285,7 +273,7 @@ def main():
             symbols = [line.strip() for line in f.readlines() if line.strip() and not line.startswith("#")]
     
     if not symbols:
-        symbols = ["600519"] # 默认测试
+        symbols = ["600519"]
 
     generated_pdfs = []
 
@@ -299,7 +287,9 @@ def main():
         with open("push_list.txt", "w", encoding="utf-8") as f:
             for pdf in generated_pdfs:
                 f.write(f"{pdf}\n")
-        print(f"\n📝 推送清单已更新: 包含 {len(generated_pdfs)} 份报告")
+        print(f"\n📝 推送清单已更新: 包含 {len(generated_pdfs)} 份看涨研报")
+    else:
+        print("\n😴 本次扫描未发现看涨机会，不发送推送。")
 
 if __name__ == "__main__":
     main()
