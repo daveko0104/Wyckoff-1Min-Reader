@@ -3,12 +3,9 @@ name: Hourly SCOB AI Scan
 on:
   workflow_dispatch:      # 允许手动触发
   schedule:
-    # === A股 SCOB 专用时刻表 ===
-    # 逻辑：每小时的第 55 分运行，捕捉 60分钟/30分钟 K线的收盘形态
-    # 北京时间: 09:55, 10:55, 11:25(午休前), 13:55, 14:55
-    # 对应的 UTC 时间如下:
-    - cron: "55 1,2,5,6 * * 1-5"  # 对应北京 09:55, 10:55, 13:55, 14:55 (周一到周五)
-    - cron: "25 3 * * 1-5"        # 对应北京 11:25 (午盘收盘前)
+    # 北京时间: 09:55, 10:55, 11:25, 13:55, 14:55
+    - cron: "55 1,2,5,6 * * 1-5"
+    - cron: "25 3 * * 1-5"
 
 permissions:
   contents: write
@@ -26,7 +23,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # === 1. 安装系统依赖 (中文字体 + PDF底层库) ===
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -38,38 +34,34 @@ jobs:
         with:
           python-version: "3.11"
 
-      # === 2. 安装 Python 依赖 ===
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # 注意：requests, markdown, xhtml2pdf 是必须的
           pip install pandas akshare mplfinance openai requests markdown xhtml2pdf
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # === 3. 运行 SCOB 分析脚本 ===
       - name: Run SCOB Analysis
         env:
-          # Google Gemini 配置
+          # === 关键配置：通义千问 API Key ===
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          
+          # 备用 Gemini (没有也没关系)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-2.0-flash-exp"  # 建议升级到 2.0 Flash (速度快且视觉强)
-          # OpenAI 配置
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          AI_MODEL: "gpt-4o"
-          # 股票池默认值
+          
+          # 其他设置
           SYMBOLS: "600519" 
-          # 获取数据量 (100根足够分析SCOB，减少Token消耗)
           BARS_COUNT: "100"
         run: |
           mkdir -p data reports
           python main.py
 
-      # === 4. 清理旧数据 (保留最近3天即可，节省空间) ===
       - name: Cleanup old data
         run: |
           echo "Cleaning up files older than 3 days..."
           find reports/ -name "*.*" -type f -mtime +3 -print -delete
           find data/ -name "*.csv" -type f -mtime +3 -print -delete
 
-      # === 5. 提交变更到仓库 ===
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -83,7 +75,6 @@ jobs:
             git push origin HEAD:main
           fi
 
-      # === 6. 推送研报到 Telegram ===
       - name: Notify Telegram (Push List)
         if: success()
         env:
@@ -100,20 +91,13 @@ jobs:
           
           echo "=== 开始推送 SCOB 分析报告 ==="
           
-          # 逐行读取 push_list.txt
           while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
-            # 去除可能的空白符
             PDF_FILE=$(echo "$PDF_FILE" | xargs)
             
             if [ -f "$PDF_FILE" ]; then
-              echo "----------------------------------------"
               echo "🚀 Sending: $PDF_FILE"
-              
               FILENAME=$(basename "$PDF_FILE")
-              
-              # 简单的文件名解析，提取周期信息用于标题
-              # 假设文件名格式: 600519_60m_report_2024...
-              CAPTION="📊 SCOB Alert: $FILENAME"
+              CAPTION="📊 SCOB Alert (Qwen): $FILENAME"
               
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
                 -F "chat_id=${TG_CHAT_ID}" \
@@ -121,11 +105,6 @@ jobs:
                 -F "caption=$CAPTION"
                 
               echo "✅ Sent."
-              # 稍微延迟，避免TG限流
               sleep 3
-            else
-              echo "::error::文件不存在: $PDF_FILE"
             fi
           done < push_list.txt
-          
-          echo "=== 推送完毕 ==="
