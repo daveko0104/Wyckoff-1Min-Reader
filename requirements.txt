@@ -3,3 +3,6 @@ pandas
 openai
 python-dotenv
 mplfinance
+requests
+markdown
+xhtml2pdf
