@@ -1,16 +1,20 @@
-name: Daily Stock AI Report
+name: Hourly SCOB AI Scan
 
 on:
   workflow_dispatch:      # 允许手动触发
   schedule:
-    - cron: "0 4 * * *"   # UTC 04:00 = 北京时间 12:00 (午盘)
-    - cron: "15 7 * * *"  # UTC 07:15 = 北京时间 15:15 (收盘)
+    # === A股 SCOB 专用时刻表 ===
+    # 逻辑：每小时的第 55 分运行，捕捉 60分钟/30分钟 K线的收盘形态
+    # 北京时间: 09:55, 10:55, 11:25(午休前), 13:55, 14:55
+    # 对应的 UTC 时间如下:
+    - cron: "55 1,2,5,6 * * 1-5"  # 对应北京 09:55, 10:55, 13:55, 14:55 (周一到周五)
+    - cron: "25 3 * * 1-5"        # 对应北京 11:25 (午盘收盘前)
 
 permissions:
   contents: write
 
 concurrency:
-  group: stock-ai-report-main
+  group: scob-ai-scan
   cancel-in-progress: true
 
 jobs:
@@ -23,8 +27,6 @@ jobs:
           fetch-depth: 0
 
       # === 1. 安装系统依赖 (中文字体 + PDF底层库) ===
-      # 必须安装 libcairo2-dev 否则 xhtml2pdf 无法安装
-      # 必须安装 fonts-wqy-microhei 否则 PDF 中文乱码
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -43,31 +45,31 @@ jobs:
           pip install pandas akshare mplfinance openai requests markdown xhtml2pdf
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # === 3. 运行分析脚本 (自动读取 stock_list.txt) ===
-      - name: Run Analysis Script
+      # === 3. 运行 SCOB 分析脚本 ===
+      - name: Run SCOB Analysis
         env:
           # Google Gemini 配置
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-3-flash-preview"
+          GEMINI_MODEL: "gemini-2.0-flash-exp"  # 建议升级到 2.0 Flash (速度快且视觉强)
           # OpenAI 配置
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: "gpt-4o"
-          # 通用配置
-          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
-          SYMBOLS: "600970" # 如果 stock_list.txt 不存在，以此为默认值
-          BARS_COUNT: "600"
+          # 股票池默认值
+          SYMBOLS: "600519" 
+          # 获取数据量 (100根足够分析SCOB，减少Token消耗)
+          BARS_COUNT: "100"
         run: |
           mkdir -p data reports
           python main.py
 
-      # === 4. 清理 7 天前的旧数据 ===
+      # === 4. 清理旧数据 (保留最近3天即可，节省空间) ===
       - name: Cleanup old data
         run: |
-          echo "Cleaning up files older than 7 days..."
-          find reports/ -name "*.*" -type f -mtime +7 -print -delete
-          find data/ -name "*.csv" -type f -mtime +7 -print -delete
+          echo "Cleaning up files older than 3 days..."
+          find reports/ -name "*.*" -type f -mtime +3 -print -delete
+          find data/ -name "*.csv" -type f -mtime +3 -print -delete
 
-      # === 5. 提交新生成的 PDF 和 CSV 到仓库 ===
+      # === 5. 提交变更到仓库 ===
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -76,12 +78,12 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "chore: daily report $(date +'%Y-%m-%d')"
+            git commit -m "chore: scob report $(date +'%Y-%m-%d %H:%M')"
             git pull --rebase origin main
             git push origin HEAD:main
           fi
 
-   # === 6. 精准推送本次生成的报告 ===
+      # === 6. 推送研报到 Telegram ===
       - name: Notify Telegram (Push List)
         if: success()
         env:
@@ -96,7 +98,7 @@ jobs:
             exit 0
           fi
           
-          echo "=== 开始推送 push_list.txt 中的文件 ==="
+          echo "=== 开始推送 SCOB 分析报告 ==="
           
           # 逐行读取 push_list.txt
           while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
@@ -109,12 +111,17 @@ jobs:
               
               FILENAME=$(basename "$PDF_FILE")
               
+              # 简单的文件名解析，提取周期信息用于标题
+              # 假设文件名格式: 600519_60m_report_2024...
+              CAPTION="📊 SCOB Alert: $FILENAME"
+              
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
                 -F "chat_id=${TG_CHAT_ID}" \
                 -F "document=@$PDF_FILE" \
-                -F "caption=📊 Analysis: $FILENAME"
+                -F "caption=$CAPTION"
                 
               echo "✅ Sent."
+              # 稍微延迟，避免TG限流
               sleep 3
             else
               echo "::error::文件不存在: $PDF_FILE"
